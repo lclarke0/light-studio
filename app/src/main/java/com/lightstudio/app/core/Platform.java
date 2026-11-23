@@ -18,6 +18,9 @@ public interface Platform {
     /** Null when YouTube import isn't available. */
     YouTubeBackend youtube();
 
+    /** Null when the server can't decode audio itself (then the browser decodes whole files). */
+    AudioDecoder decoder();
+
     /** Asks for Bluetooth permissions if needed (may show a dialog and block); true when granted. */
     boolean ensureBlePermissions();
 

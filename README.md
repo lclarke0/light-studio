@@ -14,6 +14,9 @@ the first time). New builds install as updates and keep your songs.
   tap **Find Bluetooth lights**.
 - Share a YouTube video to **Light Studio** from the YouTube app to import it.
 - AI instrument separation (Demucs) is desktop-only; the app estimates instruments from frequencies.
+- Songs of any length: anything over 20 minutes is decoded and analyzed in pieces (an 8-hour mix takes a few
+  minutes the first time, then opens instantly). Long songs get calmer default effects (beat pulse on drums,
+  smooth follow on the rest); change them with Auto-generate.
 
 ## Desktop app
 `desktop/light_studio.py` — run `python light_studio.py`. Optional extras:

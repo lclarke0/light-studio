@@ -8,6 +8,7 @@ import android.net.wifi.WifiManager;
 import android.os.Build;
 import android.util.Log;
 
+import com.lightstudio.app.core.AudioDecoder;
 import com.lightstudio.app.core.BleBackend;
 import com.lightstudio.app.core.Platform;
 import com.lightstudio.app.core.YouTubeBackend;
@@ -27,6 +28,7 @@ final class AndroidPlatform implements Platform {
     private final Context ctx;
     private final AndroidBle ble;
     private final YouTubeBackend youtube;
+    private final AudioDecoder decoder = new AndroidDecoder();
     private volatile Activity activity;
     private volatile CountDownLatch permLatch;
     private WifiManager.MulticastLock lock;
@@ -65,6 +67,8 @@ final class AndroidPlatform implements Platform {
     @Override public BleBackend ble() { return ble; }
 
     @Override public YouTubeBackend youtube() { return youtube; }
+
+    @Override public AudioDecoder decoder() { return decoder; }
 
     private boolean granted(String p) { return ctx.checkSelfPermission(p) == PackageManager.PERMISSION_GRANTED; }
 

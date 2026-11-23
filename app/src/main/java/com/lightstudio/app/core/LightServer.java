@@ -35,15 +35,16 @@ import java.util.regex.Pattern;
  * shared web UI runs unchanged. Listens on 127.0.0.1 only; API calls need the session cookie.
  */
 public final class LightServer {
-    private static final Pattern SONG_RE = Pattern.compile("^/api/song/([0-9a-f]{12})(?:/(audio|show|features|separate))?$");
+    private static final Pattern SONG_RE = Pattern.compile("^/api/song/([0-9a-f]{12})(?:/(audio|show|features|separate|tracks|info|pcm))?$");
     private static final Pattern YT_JOB_RE = Pattern.compile("^/api/youtube/([0-9a-f]{8})$");
     public static final Pattern YT_RE = Pattern.compile("^https?://((www|m|music)\\.)?(youtube\\.com|youtu\\.be)/.*", Pattern.CASE_INSENSITIVE);
     private static final Set<String> AUDIO_EXTS = new HashSet<>(Arrays.asList(
             ".mp3", ".wav", ".ogg", ".oga", ".m4a", ".aac", ".flac", ".opus", ".webm", ".mp4"));
     private static final Set<String> SHOW_KEYS = new HashSet<>(Arrays.asList(
-            "name", "cues", "tracks", "analysis", "duration", "loopA", "loopB", "segCount", "segCounts", "version"));
-    private static final long MAX_UPLOAD = 400L * 1024 * 1024;
-    private static final int MAX_MINUTES = 30;
+            "name", "cues", "tracks", "analysis", "duration", "loopA", "loopB", "segCount", "segCounts", "version", "cueCount"));
+    private static final long MAX_UPLOAD = 2500L * 1024 * 1024;   // ~8+ hours of high-quality audio
+    private static final int MAX_MINUTES = 12 * 60;
+    public static final int PCM_RATE = 11025;
     private static final SecureRandom RNG = new SecureRandom();
 
     private final Platform pf;
@@ -277,6 +278,7 @@ public final class LightServer {
     }
 
     private boolean authorized(Req r) {
+        for (String kv : r.query.split("&")) if (kv.equals("t=" + token)) return true;   // media requests
         String c = r.header("cookie");
         if (c == null) return false;
         for (String part : c.split(";")) {
@@ -406,7 +408,7 @@ public final class LightServer {
                         "id", key, "name", Json.str(s.get("name"), "Untitled"), "updated", s.getOrDefault("updated", 0L),
                         "duration", s.get("duration"),
                         "tempo", an instanceof Map ? ((Map<String, Object>) an).get("tempo") : null,
-                        "cues", cueCount(s), "ai", ai);
+                        "cues", s.containsKey("cueCount") ? (long) Json.num(s.get("cueCount"), 0) : cueCount(s), "ai", ai);
                 Object[] entry = {stamp, m};
                 summaryCache.put(key, entry);
                 items.add(entry);
@@ -472,7 +474,8 @@ public final class LightServer {
         switch (p) {
             case "/api/config": json(out, loadConfig()); return;
             case "/api/capabilities":
-                json(out, Json.obj("demucs", false, "bluetooth", pf.ble().available(), "youtube", pf.youtube() != null, "platform", pf.name()));
+                json(out, Json.obj("demucs", false, "bluetooth", pf.ble().available(), "youtube", pf.youtube() != null,
+                        "pcm", pf.decoder() != null, "platform", pf.name()));
                 return;
             case "/api/library": json(out, listLibrary()); return;
             case "/api/discover": {
@@ -515,7 +518,14 @@ public final class LightServer {
         if (!m.matches()) throw new HttpError(404, "Not found");
         String sid = m.group(1), what = m.group(2);
         File d = new File(lib, sid);
-        if ("show".equals(what)) { bytes(out, 200, "application/json", readFile(new File(d, "show.json")), null); return; }
+        if ("show".equals(what)) { bytes(out, 200, "application/json", showWithTracks(d), null); return; }
+        if ("info".equals(what)) {
+            File f = audioFile(d);
+            AudioDecoder dec = pf.decoder();
+            json(out, Json.obj("bytes", f.length(), "duration", dec == null ? null : (Object) dec.duration(f)));
+            return;
+        }
+        if ("pcm".equals(what)) { pcm(d, out); return; }
         if ("features".equals(what)) {
             File f = new File(d, "features.json");
             if (!f.isFile()) json(out, new LinkedHashMap<>());
@@ -523,18 +533,7 @@ public final class LightServer {
             return;
         }
         if ("separate".equals(what)) { json(out, Json.obj("state", "idle")); return; }
-        if ("audio".equals(what)) {
-            Map<String, Object> show = readJson(new File(d, "show.json"));
-            File f = new File(d, Json.str(show.get("file"), "audio.mp3"));
-            if (!f.isFile() || !f.getCanonicalPath().startsWith(d.getCanonicalPath())) throw new FileNotFoundException();
-            head(out, 200, mime(f.getName()), f.length(), null);
-            try (InputStream in = new FileInputStream(f)) {
-                byte[] buf = new byte[1 << 16];
-                int n;
-                while ((n = in.read(buf)) > 0) out.write(buf, 0, n);
-            }
-            return;
-        }
+        if ("audio".equals(what)) { sendAudio(r, audioFile(d), out); return; }
         throw new HttpError(404, "Not found");
     }
 
@@ -587,6 +586,7 @@ public final class LightServer {
         }
         Matcher m = SONG_RE.matcher(p);
         if (m.matches() && "show".equals(m.group(2))) { saveShow(m.group(1), r, out); return; }   // sendBeacon on page close
+        if (m.matches() && "tracks".equals(m.group(2))) { saveRaw(m.group(1), "tracks.json", '[', r, out); return; }
         if (m.matches() && "separate".equals(m.group(2)))
             throw new HttpError(400, "AI instrument separation is only in the desktop version of Light Studio.");
         throw new HttpError(404, "Not found");
@@ -595,22 +595,8 @@ public final class LightServer {
     private void put(Req r, OutputStream out) throws IOException {
         Matcher m = SONG_RE.matcher(r.path);
         if (m.matches() && "show".equals(m.group(2))) { saveShow(m.group(1), r, out); return; }
-        if (m.matches() && "features".equals(m.group(2))) {
-            File d = new File(lib, m.group(1));
-            if (!d.isDirectory()) throw new FileNotFoundException();
-            Map<String, Object> in = bodyJson(r);
-            File f = new File(d, "features.json");
-            synchronized (fileLock) {
-                if (f.isFile() && !"demucs".equals(in.get("source"))) {
-                    try {
-                        if ("demucs".equals(readJson(f).get("source"))) { json(out, Json.obj("ok", false, "kept", "demucs")); return; }
-                    } catch (IOException | RuntimeException ignored) { }
-                }
-                writeJson(f, in);
-            }
-            json(out, Json.obj("ok", true));
-            return;
-        }
+        if (m.matches() && "tracks".equals(m.group(2))) { saveRaw(m.group(1), "tracks.json", '[', r, out); return; }
+        if (m.matches() && "features".equals(m.group(2))) { saveRaw(m.group(1), "features.json", '{', r, out); return; }
         throw new HttpError(404, "Not found");
     }
 
@@ -635,6 +621,9 @@ public final class LightServer {
             File f = new File(new File(lib, sid), "show.json");
             Map<String, Object> show = readJson(f);
             for (String k : SHOW_KEYS) if (in.containsKey(k)) show.put(k, in.get(k));
+            File tracks = new File(f.getParentFile(), "tracks.json");
+            if (in.containsKey("tracks")) tracks.delete();          // an older editor saved everything in one file
+            else if (tracks.isFile()) show.remove("tracks");
             updated = System.currentTimeMillis() / 1000.0;
             show.put("updated", updated);
             writeJson(f, show);
@@ -642,10 +631,160 @@ public final class LightServer {
         json(out, Json.obj("ok", true, "updated", updated));
     }
 
+    private File audioFile(File d) throws IOException {
+        Map<String, Object> show = readJson(new File(d, "show.json"));
+        File f = new File(d, Json.str(show.get("file"), "audio.mp3"));
+        if (!f.isFile() || !f.getCanonicalPath().startsWith(d.getCanonicalPath() + File.separator)) throw new FileNotFoundException();
+        return f;
+    }
+
+    /** show.json with tracks.json spliced in (tracks live in their own file so big shows save fast). */
+    private byte[] showWithTracks(File d) throws IOException {
+        byte[] show = readFile(new File(d, "show.json"));
+        File t = new File(d, "tracks.json");
+        if (!t.isFile()) return show;
+        byte[] tracks = readFile(t);
+        int end = show.length - 1;
+        while (end > 0 && show[end] != '}') end--;
+        int prev = end - 1;
+        while (prev > 0 && (show[prev] == ' ' || show[prev] == '\n' || show[prev] == '\r' || show[prev] == '\t')) prev--;
+        byte[] mid = ((show[prev] == '{' ? "" : ",") + "\"tracks\":").getBytes(StandardCharsets.UTF_8);
+        ByteArrayOutputStream b = new ByteArrayOutputStream(show.length + tracks.length + 16);
+        b.write(show, 0, end);
+        b.write(mid);
+        b.write(tracks);
+        b.write('}');
+        return b.toByteArray();
+    }
+
+    /** Writes a JSON body straight to disk (no parsing: shows for 8-hour songs can be tens of MB). */
+    private void saveRaw(String sid, String name, char first, Req r, OutputStream out) throws IOException {
+        File d = new File(lib, sid);
+        if (!d.isDirectory()) throw new FileNotFoundException();
+        if (r.length <= 0 || r.length > 400L * 1024 * 1024) throw new IllegalArgumentException("Bad size");
+        File tmp = new File(d, name + ".tmp");
+        try (OutputStream f = new FileOutputStream(tmp)) {
+            byte[] buf = new byte[1 << 16];
+            int n;
+            boolean checked = false;
+            while ((n = r.body.read(buf)) > 0) {
+                if (!checked) {
+                    int k = 0;
+                    while (k < n && buf[k] <= ' ') k++;
+                    if (k < n) {
+                        if (buf[k] != first) throw new IllegalArgumentException("Not valid show data");
+                        checked = true;
+                    }
+                }
+                f.write(buf, 0, n);
+            }
+        } catch (IOException | RuntimeException e) {
+            tmp.delete();
+            throw e;
+        }
+        synchronized (fileLock) {
+            File f = new File(d, name);
+            if (!tmp.renameTo(f)) {
+                f.delete();
+                if (!tmp.renameTo(f)) throw new IOException("Couldn't save " + name);
+            }
+        }
+        json(out, Json.obj("ok", true));
+    }
+
+    /** Audio with HTTP Range support, so the player can stream and seek instead of loading the whole file. */
+    private static void sendAudio(Req r, File f, OutputStream out) throws IOException {
+        long size = f.length(), start = 0, end = size - 1;
+        String range = r.header("range");
+        boolean partial = false;
+        if (range != null && range.startsWith("bytes=") && !range.contains(",")) {
+            String[] se = range.substring(6).trim().split("-", -1);
+            try {
+                if (se[0].isEmpty()) { start = Math.max(0, size - Long.parseLong(se[1])); }
+                else {
+                    start = Long.parseLong(se[0]);
+                    if (se.length > 1 && !se[1].isEmpty()) end = Math.min(end, Long.parseLong(se[1]));
+                }
+                partial = true;
+            } catch (NumberFormatException ignored) { start = 0; end = size - 1; }
+        }
+        if (partial && (start >= size || start > end)) {
+            String h = "HTTP/1.1 416 Range Not Satisfiable\r\nContent-Range: bytes */" + size + "\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+            out.write(h.getBytes(StandardCharsets.ISO_8859_1));
+            return;
+        }
+        long len = end - start + 1;
+        String h = "HTTP/1.1 " + (partial ? "206 Partial Content" : "200 OK") + "\r\n"
+                + "Content-Type: " + mime(f.getName()) + "\r\n"
+                + "Content-Length: " + len + "\r\n"
+                + "Accept-Ranges: bytes\r\n"
+                + (partial ? "Content-Range: bytes " + start + "-" + end + "/" + size + "\r\n" : "")
+                + "Cache-Control: no-store\r\nConnection: close\r\n\r\n";
+        out.write(h.getBytes(StandardCharsets.ISO_8859_1));
+        try (java.io.RandomAccessFile raf = new java.io.RandomAccessFile(f, "r")) {
+            raf.seek(start);
+            byte[] buf = new byte[1 << 16];
+            long left = len;
+            while (left > 0) {
+                int n = raf.read(buf, 0, (int) Math.min(buf.length, left));
+                if (n <= 0) break;
+                out.write(buf, 0, n);
+                left -= n;
+            }
+        }
+    }
+
+    /** Streams the whole song as mono 16-bit PCM at PCM_RATE (chunked), for analyzing long songs. */
+    private void pcm(File d, OutputStream out) throws IOException {
+        AudioDecoder dec = pf.decoder();
+        if (dec == null) throw new HttpError(400, "This version can't decode long songs");
+        File f = audioFile(d);
+        double dur = dec.duration(f);
+        String h = "HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\nTransfer-Encoding: chunked\r\n"
+                + "X-Sample-Rate: " + PCM_RATE + "\r\nX-Duration: " + dur + "\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n";
+        out.write(h.getBytes(StandardCharsets.ISO_8859_1));
+        OutputStream chunked = new OutputStream() {
+            private final byte[] buf = new byte[1 << 16];
+            private int n;
+
+            @Override public void write(int b) throws IOException {
+                buf[n++] = (byte) b;
+                if (n == buf.length) flush();
+            }
+
+            @Override public void write(byte[] b, int off, int len) throws IOException {
+                while (len > 0) {
+                    int k = Math.min(len, buf.length - n);
+                    System.arraycopy(b, off, buf, n, k);
+                    n += k; off += k; len -= k;
+                    if (n == buf.length) flush();
+                }
+            }
+
+            @Override public void flush() throws IOException {
+                if (n == 0) return;
+                out.write((Integer.toHexString(n) + "\r\n").getBytes(StandardCharsets.ISO_8859_1));
+                out.write(buf, 0, n);
+                out.write("\r\n".getBytes(StandardCharsets.ISO_8859_1));
+                n = 0;
+                out.flush();
+            }
+        };
+        try {
+            dec.decode(f, PCM_RATE, chunked);
+        } catch (IOException e) {
+            throw e;
+        } catch (Exception e) {
+            pf.log("Decode failed: " + e);   // the browser sees a short stream and reports it
+        }
+        chunked.flush();
+        out.write("0\r\n\r\n".getBytes(StandardCharsets.ISO_8859_1));
+    }
+
     private void upload(Req r, OutputStream out) throws IOException {
         String name = URLDecoder.decode(Json.str(r.header("x-filename"), "song"), "UTF-8");
         if (r.length <= 0) throw new HttpError(400, "Empty file");
-        if (r.length > MAX_UPLOAD) throw new HttpError(413, "File is larger than 400 MB");
+        if (r.length > MAX_UPLOAD) throw new HttpError(413, "File is larger than 2.5 GB");
         int slash = Math.max(name.lastIndexOf('/'), name.lastIndexOf('\\'));
         if (slash >= 0) name = name.substring(slash + 1);
         int dot = name.lastIndexOf('.');

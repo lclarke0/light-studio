@@ -10,8 +10,8 @@ android {
         applicationId "com.lightstudio.app"
         minSdk 26
         targetSdk 34
-        versionCode 1
-        versionName "1.0"
+        versionCode 2
+        versionName "1.1"
     }
 
     // Fixed key so each new build installs as an update over the previous one

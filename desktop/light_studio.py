@@ -54,8 +54,8 @@ AUDIO_EXTS = {".mp3", ".wav", ".ogg", ".oga", ".m4a", ".aac", ".flac", ".opus", 
 YT_RE = re.compile(r"^https?://((www|m|music)\.)?(youtube\.com|youtu\.be)/", re.I)
 MAX_MINUTES = 30
 MAX_UPLOAD = 400 * 1024 * 1024
-SONG_RE = re.compile(r"^/api/song/([0-9a-f]{12})(?:/(audio|show|features|separate))?$")
-SHOW_KEYS = {"name", "cues", "tracks", "analysis", "duration", "loopA", "loopB", "segCount", "segCounts", "version"}
+SONG_RE = re.compile(r"^/api/song/([0-9a-f]{12})(?:/(audio|show|features|separate|tracks|info))?$")
+SHOW_KEYS = {"name", "cues", "tracks", "analysis", "duration", "loopA", "loopB", "segCount", "segCounts", "version", "cueCount"}
 
 GOVEE_CMD_PORT = 4003
 GOVEE_RESP_PORT = 4002
@@ -157,7 +157,7 @@ def list_library():
         items.append({
             "id": d.name, "name": s.get("name") or "Untitled", "updated": s.get("updated", 0),
             "duration": s.get("duration"), "tempo": (s.get("analysis") or {}).get("tempo"),
-            "cues": cue_count(s), "ai": source == "demucs",
+            "cues": s["cueCount"] if isinstance(s.get("cueCount"), int) else cue_count(s), "ai": source == "demucs",
         })
     items.sort(key=lambda i: i["updated"], reverse=True)
     return items
@@ -746,7 +746,8 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/api/config":
             return self._json(load_config())
         if path == "/api/capabilities":
-            return self._json({"demucs": demucs_available(), "bluetooth": BLE.available, "youtube": youtube_available()})
+            return self._json({"demucs": demucs_available(), "bluetooth": BLE.available, "youtube": youtube_available(),
+                               "pcm": False, "platform": "desktop"})
         m = re.match(r"^/api/youtube/([0-9a-f]{8})$", path)
         if m:
             return self._json(YT_JOBS.get(m.group(1), {"state": "error", "msg": "Unknown download"}))
@@ -772,7 +773,14 @@ class Handler(BaseHTTPRequestHandler):
             return self._error(404, "Not found")
         sid, what = m.groups()
         if what == "show":
-            return self._json(read_show(sid))
+            show = read_show(sid)
+            tracks = LIBRARY / sid / "tracks.json"
+            if tracks.exists():
+                show["tracks"] = json.loads(tracks.read_text())
+            return self._json(show)
+        if what == "info":
+            show = read_show(sid)
+            return self._json({"bytes": (LIBRARY / sid / show["file"]).stat().st_size, "duration": None})
         if what == "audio":
             return self._send_audio(sid)
         if what == "features":
@@ -827,6 +835,8 @@ class Handler(BaseHTTPRequestHandler):
         m = SONG_RE.match(path)
         if m and m.group(2) == "show":          # sendBeacon save when the page closes
             return self._save_show(m.group(1))
+        if m and m.group(2) == "tracks":
+            return self._save_tracks(m.group(1))
         if m and m.group(2) == "separate":
             return self._start_separation(m.group(1))
         self._error(404, "Not found")
@@ -835,6 +845,8 @@ class Handler(BaseHTTPRequestHandler):
         m = SONG_RE.match(urlparse(self.path).path)
         if m and m.group(2) == "show":
             return self._save_show(m.group(1))
+        if m and m.group(2) == "tracks":
+            return self._save_tracks(m.group(1))
         if m and m.group(2) == "features":
             return self._save_features(m.group(1))
         self._error(404, "Not found")
@@ -917,9 +929,27 @@ class Handler(BaseHTTPRequestHandler):
             for k in SHOW_KEYS:
                 if k in incoming:
                     show[k] = incoming[k]
+            tracks = LIBRARY / sid / "tracks.json"
+            if "tracks" in incoming:
+                tracks.unlink(missing_ok=True)     # an older editor saved everything in one file
+            elif tracks.exists():
+                show.pop("tracks", None)
             show["updated"] = time.time()
             write_json(LIBRARY / sid / "show.json", show)
         self._json({"ok": True, "updated": show["updated"]})
+
+    def _save_tracks(self, sid):
+        d = LIBRARY / sid
+        if not d.is_dir():
+            raise FileNotFoundError(sid)
+        raw = self._body(limit=400 * 1024 * 1024)
+        if not raw.lstrip().startswith(b"["):
+            raise ValueError("Not valid show data")
+        with _file_lock:
+            tmp = d / "tracks.json.tmp"
+            tmp.write_bytes(raw)
+            tmp.replace(d / "tracks.json")
+        self._json({"ok": True})
 
     def _save_features(self, sid):
         incoming = self._body_json()
@@ -949,16 +979,45 @@ class Handler(BaseHTTPRequestHandler):
         self._json({"ok": True})
 
     def _send_audio(self, sid):
+        """Audio with HTTP Range support so the player streams and seeks instead of loading the whole file."""
         show = read_show(sid)
         f = LIBRARY / sid / show["file"]
         ctype = mimetypes.guess_type(f.name)[0] or "application/octet-stream"
-        self.send_response(200)
+        size = f.stat().st_size
+        start, end, partial = 0, size - 1, False
+        rng = self.headers.get("Range", "")
+        m = re.match(r"^bytes=(\d*)-(\d*)$", rng.strip())
+        if m and (m.group(1) or m.group(2)):
+            if m.group(1):
+                start = int(m.group(1))
+                if m.group(2):
+                    end = min(end, int(m.group(2)))
+            else:
+                start = max(0, size - int(m.group(2)))
+            partial = True
+            if start >= size or start > end:
+                self.send_response(416)
+                self.send_header("Content-Range", f"bytes */{size}")
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+                return
+        self.send_response(206 if partial else 200)
         self.send_header("Content-Type", ctype)
-        self.send_header("Content-Length", str(f.stat().st_size))
+        self.send_header("Content-Length", str(end - start + 1))
+        self.send_header("Accept-Ranges", "bytes")
+        if partial:
+            self.send_header("Content-Range", f"bytes {start}-{end}/{size}")
         self.send_header("Cache-Control", "no-store")
         self.end_headers()
         with open(f, "rb") as fh:
-            shutil.copyfileobj(fh, self.wfile, 1 << 20)
+            fh.seek(start)
+            left = end - start + 1
+            while left > 0:
+                chunk = fh.read(min(1 << 20, left))
+                if not chunk:
+                    break
+                self.wfile.write(chunk)
+                left -= len(chunk)
 
 
 def main():
@@ -1368,7 +1427,12 @@ function analyzeSamples(x, sr){
     }
     onsetRaw[f] = f === 0 ? 0 : flux; rms[f] = Math.sqrt(ss / N);
   }
-  const fps = sr / H, w = Math.round(fps * 0.5), onset = new Float32Array(nF);
+  return beatsFromFrames(onsetRaw, rms, nF, sr / H, f => (f * H + N / 2) / sr);
+}
+
+// Tempo, beats, loudness per beat and biggest hits from per-frame onset strength and loudness.
+function beatsFromFrames(onsetRaw, rms, nF, fps, toTime){
+  const w = Math.round(fps * 0.5), onset = new Float32Array(nF);
   { const cs = new Float64Array(nF + 1); for (let f = 0; f < nF; f++) cs[f + 1] = cs[f] + onsetRaw[f];
     for (let f = 0; f < nF; f++){ const a = Math.max(0, f - w), b = Math.min(nF, f + w + 1); onset[f] = Math.max(0, onsetRaw[f] - (cs[b] - cs[a]) / (b - a)); } }
   let mean = 0; for (let f = 0; f < nF; f++) mean += onset[f]; mean /= Math.max(1, nF);
@@ -1405,10 +1469,19 @@ function analyzeSamples(x, sr){
   const thr = 0.5 * percentile(peaks, 50);
   let end = nF - 1;
   for (let t = nF - 2; t > 0; t--) if (cs[t] >= cs[t - 1] && cs[t] >= cs[t + 1] && cs[t] > thr){ end = t; break; }
-  const frames = []; for (let t = end; t >= 0; t = back[t]) frames.push(t);
+  let frames = []; for (let t = end; t >= 0; t = back[t]) frames.push(t);
   frames.reverse();
+  let tempoOut = tempo;
+  if (tempo / 2 >= 60 && frames.length > 16){
+    // loudness right after each beat: the kick lands on the real beats, hi-hats alone sit in between
+    const punch = f => { let m = 0; for (let k = f; k <= Math.min(nF - 1, f + 4); k++) if (rms[k] > m) m = rms[k]; return m; };
+    const sum = [0, 0];
+    frames.forEach((f, i) => { sum[i & 1] += punch(f); });
+    const strong = sum[0] >= sum[1] ? 0 : 1, ratio = Math.min(sum[0], sum[1]) / Math.max(1e-9, sum[0], sum[1]);
+    if (ratio < 0.7){ frames = frames.filter((_, i) => (i & 1) === strong); tempoOut = tempo / 2; }
+  }
 
-  const rmsMax = percentile(rms, 99) || 1, toTime = f => (f * H + N / 2) / sr;
+  const rmsMax = percentile(rms.subarray(0, nF), 99) || 1;
   const rawLoud = [], beatTimes = [];
   for (const f of frames){
     let s = 0, c = 0;
@@ -1420,7 +1493,7 @@ function analyzeSamples(x, sr){
   const l0 = percentile(rawLoud, 10), l1 = percentile(rawLoud, 98);
   const loud = rawLoud.map(v => Math.round(Math.min(1, Math.max(0, (v - l0) / Math.max(1e-9, l1 - l0))) * 1000) / 1000);
 
-  const loudThr = percentile(rms, 60), cand = [];
+  const loudThr = percentile(rms.subarray(0, nF), 60), cand = [];
   for (let f = 3; f < nF - 3; f++){
     let isMax = true; for (let k = f - 3; k <= f + 3; k++) if (onset[k] > onset[f]){ isMax = false; break; }
     if (isMax && rms[Math.min(nF - 1, f + 2)] >= loudThr) cand.push([onset[f], f]);
@@ -1433,7 +1506,7 @@ function analyzeSamples(x, sr){
     if (hits.every(h => Math.abs(h - t) > 1.5)) hits.push(Math.round(t * 1000) / 1000);
   }
   hits.sort((a, b) => a - b);
-  return { version: 1, tempo: Math.round(tempo * 10) / 10, beats: beatTimes, loud, hits };
+  return { version: 1, tempo: Math.round(tempoOut * 10) / 10, beats: beatTimes, loud, hits };
 }
 
 // Onset times + strength (0..1) from a flux curve; skips anything where gate(t) is false.
@@ -1482,7 +1555,12 @@ function bandFeatures(x, sr){
     }
     prev.set(cur);
   }
-  const fps = sr / H, toTime = f => (f * H + N / 2) / sr, nE = Math.ceil((x.length / sr) * rate) + 1;
+  return bandsFromFrames(energy, flux, nF, sr / H, f => (f * H + N / 2) / sr, x.length / sr, rate);
+}
+
+// Per-instrument loudness envelope (at `rate` per second) and hit times from per-frame band energy/flux.
+function bandsFromFrames(energy, flux, nF, fps, toTime, durSec, rate){
+  const names = Object.keys(energy), nE = Math.ceil(durSec * rate) + 1;
   const envRaw = {}, p99 = {};
   for (const nm of names){
     const s = new Float32Array(nE), c = new Uint16Array(nE);
@@ -1493,10 +1571,75 @@ function bandFeatures(x, sr){
   const ref = Math.max(...Object.values(p99)) || 1, tracks = {};
   for (const nm of names){
     const norm = Math.max(p99[nm], 0.12 * ref, 1e-9), env = Array.from(envRaw[nm], v => { const e = Math.min(1, v / norm); return e < 0.05 ? 0 : Math.round(e * 1000) / 1000; });
-    const onsets = pickOnsets(flux[nm], fps, toTime, t => { const j = Math.floor(t * rate); return Math.max(env[j] || 0, env[j + 1] || 0, env[j + 2] || 0, env[j + 3] || 0) > 0.05; });
+    const onsets = pickOnsets(flux[nm].subarray(0, nF), fps, toTime, t => { const j = Math.floor(t * rate); return Math.max(env[j] || 0, env[j + 1] || 0, env[j + 2] || 0, env[j + 3] || 0) > 0.05; });
     tracks[nm] = { env, onsets };
   }
   return { source: "bands", rate, tracks };
+}
+
+// Streaming analysis for very long songs (hours): feed mono 16-bit samples piece by piece; only small
+// per-frame numbers are kept, never the audio itself. Same features as analyzeSamples + bandFeatures.
+function makeStreamAnalyzer(sr, estSeconds, opts = {}){
+  const N = 512, H = 256, half = N >> 1, binHz = sr / N, names = Object.keys(BANDS);
+  const waveRate = opts.waveRate || 10, featRate = opts.featRate || 20, maxBin = Math.min(half, Math.round(10000 / binHz));
+  const ranges = {};
+  for (const k of names) ranges[k] = BANDS[k].map(([a, b]) => [Math.max(1, Math.round(a / binHz)), Math.min(half - 1, Math.round(b / binHz))]).filter(([a, b]) => b >= a);
+  let cap = Math.max(4096, Math.ceil(estSeconds * sr / H) + 4096);
+  let onsetRaw = new Float32Array(cap), rms = new Float32Array(cap);
+  const energy = {}, flux = {};
+  for (const k of names){ energy[k] = new Float32Array(cap); flux[k] = new Float32Array(cap); }
+  const grow = () => {
+    const nc = Math.ceil(cap * 1.5), g = a => { const b = new Float32Array(nc); b.set(a); return b; };
+    onsetRaw = g(onsetRaw); rms = g(rms);
+    for (const k of names){ energy[k] = g(energy[k]); flux[k] = g(flux[k]); }
+    cap = nc;
+  };
+  const win = new Float32Array(N); for (let i = 0; i < N; i++) win[i] = 0.5 - 0.5 * Math.cos(2 * Math.PI * i / N);
+  const buf = new Float32Array(N), re = new Float32Array(N), im = new Float32Array(N), prev = new Float32Array(half), cur = new Float32Array(half), mag2 = new Float32Array(half);
+  const waveStep = sr / waveRate, wave = [];
+  let fill = 0, nF = 0, total = 0, wavePeak = 0, waveNext = waveStep;
+  function frame(){
+    if (nF >= cap) grow();
+    let ss = 0;
+    for (let i = 0; i < N; i++){ const v = buf[i]; ss += v * v; re[i] = v * win[i]; im[i] = 0; }
+    fftInPlace(re, im);
+    for (let k = 0; k < half; k++){ const m2 = re[k] * re[k] + im[k] * im[k]; mag2[k] = m2; cur[k] = Math.log1p(100 * Math.sqrt(m2)); }
+    let fl = 0;
+    for (let k = 1; k < maxBin; k++){ const d = cur[k] - prev[k]; if (d > 0) fl += d; }
+    onsetRaw[nF] = nF ? fl : 0; rms[nF] = Math.sqrt(ss / N);
+    for (const nm of names){
+      let e = 0, bf = 0;
+      for (const [a, b] of ranges[nm]){
+        let rf = 0; for (let k = a; k <= b; k++){ e += mag2[k]; const d = cur[k] - prev[k]; if (d > 0) rf += d; }
+        bf += rf / (b - a + 1);
+      }
+      energy[nm][nF] = Math.sqrt(e); flux[nm][nF] = nF ? bf : 0;
+    }
+    prev.set(cur);
+    nF++;
+  }
+  return {
+    seconds: () => total / sr,
+    push(samples){                      // Int16Array (or Float32Array in -1..1)
+      const scale = samples instanceof Int16Array ? 1 / 32768 : 1;
+      for (let i = 0; i < samples.length; i++){
+        const v = samples[i] * scale;
+        buf[fill++] = v; total++;
+        const a = v < 0 ? -v : v; if (a > wavePeak) wavePeak = a;
+        if (total >= waveNext){ wave.push(wavePeak); wavePeak = 0; waveNext += waveStep; }
+        if (fill === N){ frame(); buf.copyWithin(0, H); fill = N - H; }
+      }
+    },
+    finish(){
+      if (wavePeak > 0) wave.push(wavePeak);
+      const fps = sr / H, toTime = f => (f * H + N / 2) / sr, dur = total / sr;
+      const an = beatsFromFrames(onsetRaw, rms, nF, fps, toTime);
+      const feat = bandsFromFrames(energy, flux, nF, fps, toTime, dur, featRate);
+      let mx = 1e-9; for (const v of wave) if (v > mx) mx = v;
+      feat.wave = { rate: waveRate, duration: Math.round(dur * 1000) / 1000, data: wave.map(v => Math.round(v / mx * 100) / 100) };
+      return { an, feat, dur };
+    },
+  };
 }
 
 function buildEnvelope(x, sr, rate){
@@ -1571,13 +1714,13 @@ function generateTrack(style, f, an, o, t0, t1){
       out.push({ t: r3(ds), color: "#000000", brightness: br, fade: r3(Math.max(0.05, Math.min(0.45, (next - ds) * 0.85))) });
     }
   } else if (style === "follow"){
-    const step = 0.1, a = o.smooth ?? 0.55;
+    const step = o.step || 0.1, a = o.smooth ?? 0.55, minChange = o.minChange || 6;
     let sm = 0, prevBr = 0, prevCol = "#000000";
     for (let t = t0; t < endT; t += step){
       sm += (envMax(f, t, t + step) - sm) * a;
       const on = sm >= 0.08, br = on ? Math.round(15 + 85 * Math.min(1, sm)) : 0, col = on ? colorAt(t) : "#000000";
       if (!on){ if (prevBr > 0){ out.push({ t: r3(t), color: "#000000", brightness: prevBr, fade: 0.2 }); prevBr = 0; prevCol = "#000000"; } continue; }
-      if (prevBr === 0 || col !== prevCol || Math.abs(br - prevBr) >= 6){
+      if (prevBr === 0 || col !== prevCol || Math.abs(br - prevBr) >= minChange){
         out.push({ t: r3(t), color: col, brightness: br, fade: prevBr === 0 ? 0.08 : (col !== prevCol ? 0.35 : step) });
         prevBr = br; prevCol = col;
       }
@@ -1617,12 +1760,14 @@ function generateTrack(style, f, an, o, t0, t1){
       busy.push([d, d + Math.max(0.5, bl)]);
     }
     busy.sort((a, b) => a[0] - b[0]);
-    const isBusy = t => { for (const [a, b] of busy){ if (a > t) break; if (t < b) return true; } return false; };
+    let bi = 0, reach = -Infinity;                       // t only moves forward, so walk the busy list once
+    const isBusy = t => { while (bi < busy.length && busy[bi][0] <= t){ reach = Math.max(reach, busy[bi][1]); bi++; } return t < reach; };
+    const step = o.step || 0.1, minChange = o.minChange || 6;
     let prevBr = -1, prevCol = null;
-    for (let t = t0; t < endT; t += 0.1){
+    for (let t = t0; t < endT; t += step){
       if (isBusy(t)){ prevBr = -1; continue; }
       const br = baseAt(t), col = br ? colorAt(t) : "#000000";
-      if (prevBr === -1 || col !== prevCol || Math.abs(br - prevBr) >= 6){ out.push({ t: r3(t), color: col, brightness: br || 100, fade: 0.1 }); prevBr = br; prevCol = col; }
+      if (prevBr === -1 || col !== prevCol || Math.abs(br - prevBr) >= minChange){ out.push({ t: r3(t), color: col, brightness: br || 100, fade: step }); prevBr = br; prevCol = col; }
     }
   }
   out.sort((a, b) => a.t - b.t);
@@ -1680,8 +1825,9 @@ const r3 = v => Math.round(v * 1000) / 1000;
 const tick = () => new Promise(r => setTimeout(r, 30));
 function fmtTime(t, hund){
   t = Math.max(0, t || 0);
-  const m = Math.floor(t / 60), s = t - m * 60;
-  return hund ? `${m}:${s.toFixed(2).padStart(5, "0")}` : `${m}:${String(Math.floor(s)).padStart(2, "0")}`;
+  const h = Math.floor(t / 3600), m = Math.floor((t - h * 3600) / 60), s = t - h * 3600 - m * 60;
+  const ss = hund ? s.toFixed(2).padStart(5, "0") : String(Math.floor(s)).padStart(2, "0");
+  return h ? `${h}:${String(m).padStart(2, "0")}:${ss}` : `${m}:${ss}`;
 }
 async function api(path, opts = {}){
   const r = await fetch(path, opts);
@@ -1707,6 +1853,7 @@ const TRACK_DEFAULTS = {
 const STYLE_NAMES = { punch: "Punch — hits, drops & big dynamics", hits: "Flash on each hit", follow: "Follow its volume", pulse: "Pulse on the beat", off: "Off" };
 const ACCENT_STYLES = { hits: "Flash on big hits + strobe on drops", pulse: "Pulse whole strip on the beat", off: "Off" };
 const computeDrops = () => detectDrops(S.feat && S.feat.tracks && S.feat.tracks.bass, S.an);
+function prepFeat(feat){ if (feat && feat.tracks) for (const k in feat.tracks) feat.tracks[k].rate = feat.rate || 50; return feat; }
 
 const S = {
   id: null, show: null, tracks: [], an: null, feat: null, ab: null, env: null, envRate: 200, dur: 0,
@@ -1715,7 +1862,7 @@ const S = {
   cfg: { send: true, latency_ms: 0, rate: 20, master: 100, devices: [] },
   caps: { demucs: false, bluetooth: false }, identify: {}, devStatus: {},
 };
-let audioUrl = null, saveTimer = null, pollTimer = null;
+let saveTimer = null, pollTimer = null;
 
 // ---------------------------------------------------------------- tracks & show data
 function normCue(c){
@@ -1776,7 +1923,9 @@ function rescaleDevice(id, oldN, newN){
   }
 }
 function genTrackCues(tr, o, t0, t1){
-  const opts = { palette: tr.palette, bpc: o.bpc, smooth: tr.feature === "vocals" ? 0.35 : 0.6, drops: S.drops || [] };
+  const long = isLong();
+  const opts = { palette: tr.palette, bpc: o.bpc, smooth: tr.feature === "vocals" ? 0.35 : 0.6, drops: S.drops || [],
+                 step: long ? 0.25 : 0.1, minChange: long ? 10 : 6 };
   if (!tr.feature) return generateAccents(tr.style, S.an, opts, t0, t1);
   return generateTrack(tr.style, S.feat && S.feat.tracks[tr.feature], S.an, opts, t0, t1);
 }
@@ -1804,23 +1953,40 @@ function restore(json){
   for (const t of S.tracks){ const d = byId.get(t.id); if (d){ t.segs = d.segs; t.cues = d.cues; } }
   S.sel.clear(); changed(); renderLayout(); renderHeads();
 }
-function pushUndo(){ S.undo.push(snapshot()); if (S.undo.length > 120) S.undo.shift(); S.redo = []; S.edited = true; }
+function capUndo(){ const big = S.undo.length && S.undo[S.undo.length - 1].length > 2e6; while (S.undo.length > (big ? 12 : 120)) S.undo.shift(); }   // hours-long shows: keep fewer steps
+function pushUndo(){ S.undo.push(snapshot()); capUndo(); S.redo = []; S.edited = true; }
 function undo(){ if (!S.undo.length) return; S.redo.push(snapshot()); restore(S.undo.pop()); }
 function redo(){ if (!S.redo.length) return; S.undo.push(snapshot()); restore(S.redo.pop()); }
 
+// The show is saved as two parts: small details (name, beats, loop…) and the lanes with all their cues,
+// which can be tens of MB for an hours-long song and is only re-sent when it changed.
 function showBody(){
-  return { version: 2, name: S.show.name, tracks: S.tracks.map(({ _ev, ...t }) => t), analysis: S.an,
-           duration: r3(S.dur), loopA: S.A, loopB: S.B, segCounts: segCounts() };
+  return { version: 2, name: S.show.name, analysis: S.an, duration: r3(S.dur), loopA: S.A, loopB: S.B, segCounts: segCounts(),
+           cueCount: S.tracks.reduce((n, t) => n + t.cues.length, 0) };
 }
-function scheduleSave(){ $("saveState").textContent = "Unsaved changes…"; clearTimeout(saveTimer); saveTimer = setTimeout(saveNow, 800); }
+const tracksBody = () => JSON.stringify(S.tracks.map(({ _ev, ...t }) => t));
+function scheduleSave(detailsOnly){
+  if (!detailsOnly) S.tracksDirty = true;
+  $("saveState").textContent = "Unsaved changes…"; clearTimeout(saveTimer); saveTimer = setTimeout(saveNow, isLong() ? 1500 : 800);
+}
 async function saveNow(){
   clearTimeout(saveTimer); saveTimer = null;
   if (!S.id) return;
-  try { await api(`/api/song/${S.id}/show`, { method: "PUT", body: JSON.stringify(showBody()) }); $("saveState").textContent = "Saved ✓"; loadLibrary(); }
-  catch (e){ $("saveState").textContent = "Save failed – " + e.message; }
+  const id = S.id;
+  try {
+    if (S.tracksDirty){
+      S.tracksDirty = false;
+      try { await api(`/api/song/${id}/tracks`, { method: "PUT", body: tracksBody() }); }
+      catch (e){ if (S.id === id) S.tracksDirty = true; throw e; }
+    }
+    await api(`/api/song/${id}/show`, { method: "PUT", body: JSON.stringify(showBody()) });
+    $("saveState").textContent = "Saved ✓"; loadLibrary();
+  } catch (e){ $("saveState").textContent = "Save failed – " + e.message; }
 }
 window.addEventListener("pagehide", () => {
-  if (saveTimer && S.id) navigator.sendBeacon(`/api/song/${S.id}/show`, new Blob([JSON.stringify(showBody())], { type: "application/json" }));
+  if (!saveTimer || !S.id) return;
+  if (S.tracksDirty) navigator.sendBeacon(`/api/song/${S.id}/tracks`, new Blob([tracksBody()], { type: "application/json" }));
+  navigator.sendBeacon(`/api/song/${S.id}/show`, new Blob([JSON.stringify(showBody())], { type: "application/json" }));
 });
 
 // ---------------------------------------------------------------- global light settings
@@ -2101,36 +2267,85 @@ async function uploadFile(file){
   finally { hideBusy(); }
 }
 
+const LONG_SONG = 20 * 60;                    // seconds; longer songs are analyzed as a stream
+const MEDIA_TOKEN = new URLSearchParams(location.search).get("t");
+const mediaUrl = id => `/api/song/${id}/audio` + (MEDIA_TOKEN ? `?t=${encodeURIComponent(MEDIA_TOKEN)}` : "");
+const isLong = () => S.dur > LONG_SONG;
+const yieldUi = () => new Promise(r => setTimeout(r, 0));
+
+async function analyzeLong(id, estDur){
+  showBusy("Decoding the song…");
+  const res = await fetch(`/api/song/${id}/pcm`);
+  if (!res.ok || !res.body) throw new Error("this phone couldn't decode the song");
+  const sr = +res.headers.get("X-Sample-Rate") || 11025, hdr = +res.headers.get("X-Duration");
+  const est = hdr > 0 ? hdr : estDur > 0 ? estDur : 3600;
+  const A = makeStreamAnalyzer(sr, est), reader = res.body.getReader(), t0 = performance.now();
+  let carry = -1, lastUi = 0;
+  for (;;){
+    const { done, value } = await reader.read();
+    if (done) break;
+    let u = value;
+    if (carry >= 0){ const m = new Uint8Array(u.length + 1); m[0] = carry; m.set(u, 1); u = m; carry = -1; }
+    if (u.length & 1){ carry = u[u.length - 1]; u = u.subarray(0, u.length - 1); }
+    if (u.byteOffset & 1) u = u.slice();
+    A.push(new Int16Array(u.buffer, u.byteOffset, u.length >> 1));
+    const now = performance.now();
+    if (now - lastUi > 300){
+      lastUi = now;
+      const sec = A.seconds(), frac = Math.min(0.999, sec / est), left = frac > 0.01 ? (now - t0) / frac * (1 - frac) / 1000 : 0;
+      showBusy(`Analyzing the whole song… ${fmtTime(sec)} of ${fmtTime(est)} (${Math.floor(frac * 100)}%)` + (left > 5 ? ` · about ${fmtTime(left)} left` : ""));
+      await yieldUi();
+    }
+  }
+  if (A.seconds() < 1) throw new Error("this phone couldn't decode the song");
+  showBusy("Finding the beat and the instruments…"); await tick();
+  return A.finish();
+}
+
 async function openSong(id, isNew){
   if (saveTimer) await saveNow();
   audio.pause(); clearTimeout(pollTimer);
   showBusy("Loading song…");
   try {
     const show = await api(`/api/song/${id}/show`);
-    const res = await fetch(`/api/song/${id}/audio`);
-    if (!res.ok) throw new Error("couldn't load the audio file");
-    const buf = await res.arrayBuffer();
-    if (audioUrl) URL.revokeObjectURL(audioUrl);
-    audioUrl = URL.createObjectURL(new Blob([buf], { type: res.headers.get("Content-Type") || "audio/mpeg" }));
-    showBusy("Reading audio…"); await tick();
-    const ctx = new (window.AudioContext || window.webkitAudioContext)();
-    let ab;
-    try { ab = await ctx.decodeAudioData(buf.slice(0)); }
-    catch (e){ throw new Error("your browser can't decode this file. Try converting it to mp3."); }
-    finally { ctx.close(); }
-    const mono = mixToMono(ab);
-    S.env = buildEnvelope(mono, ab.sampleRate, S.envRate);
-    let an = show.analysis, fresh = false;
-    if (!an || !an.beats){ showBusy("Finding the beat…"); await tick(); an = analyzeSamples(mono, ab.sampleRate); fresh = true; }
+    let info = null;
+    try { info = await api(`/api/song/${id}/info`); } catch (e){ /* older server */ }
+    const long = !!S.caps.pcm && !!info && ((info.duration || 0) > LONG_SONG || (!(info.duration > 0) && info.bytes > 40e6));
     let feat = null;
     try { feat = await api(`/api/song/${id}/features`); } catch (e){ /* none yet */ }
-    if (!feat || !feat.tracks){
-      showBusy("Listening for each instrument…"); await tick();
-      feat = bandFeatures(mono, ab.sampleRate);
-      api(`/api/song/${id}/features`, { method: "PUT", body: JSON.stringify(feat) }).catch(() => {});
+    let an = show.analysis, fresh = false, ab = null, dur;
+    if (long){
+      if (!an || !an.beats || !feat || !feat.tracks || !feat.wave){
+        const r = await analyzeLong(id, info.duration);
+        an = r.an; feat = r.feat; fresh = true;
+        showBusy("Saving the analysis…"); await tick();
+        await api(`/api/song/${id}/features`, { method: "PUT", body: JSON.stringify(feat) });
+      }
+      S.envRate = feat.wave.rate; S.env = Float32Array.from(feat.wave.data);
+      dur = feat.wave.duration || show.duration || info.duration;
+    } else {
+      if (info && !S.caps.pcm && info.bytes > 250e6) throw new Error("this file is too long to analyze here. Very long songs (hours) work in the Android app.");
+      const res = await fetch(mediaUrl(id));
+      if (!res.ok) throw new Error("couldn't load the audio file");
+      const buf = await res.arrayBuffer();
+      showBusy("Reading audio…"); await tick();
+      const ctx = new (window.AudioContext || window.webkitAudioContext)();
+      try { ab = await ctx.decodeAudioData(buf); }
+      catch (e){ throw new Error("your browser can't decode this file. Try converting it to mp3."); }
+      finally { ctx.close(); }
+      const mono = mixToMono(ab);
+      S.envRate = 200; S.env = buildEnvelope(mono, ab.sampleRate, S.envRate);
+      if (!an || !an.beats){ showBusy("Finding the beat…"); await tick(); an = analyzeSamples(mono, ab.sampleRate); fresh = true; }
+      if (!feat || !feat.tracks){
+        showBusy("Listening for each instrument…"); await tick();
+        feat = bandFeatures(mono, ab.sampleRate);
+        api(`/api/song/${id}/features`, { method: "PUT", body: JSON.stringify(feat) }).catch(() => {});
+      }
+      dur = ab.duration;
     }
-    audio.src = audioUrl;
-    Object.assign(S, { id, show, an, feat, ab, dur: ab.duration, A: show.loopA ?? null, B: show.loopB ?? null, undo: [], redo: [], edited: false, active: 0, paint: 0 });
+    audio.src = mediaUrl(id);
+    prepFeat(feat);
+    Object.assign(S, { id, show, an, feat, ab, dur, A: show.loopA ?? null, B: show.loopB ?? null, undo: [], redo: [], edited: false, active: 0, paint: 0 });
     S.drops = computeDrops();
     S.sel.clear();
     if (Array.isArray(show.tracks) && show.tracks.length){
@@ -2139,7 +2354,9 @@ async function openSong(id, isNew){
       for (const d of S.cfg.devices) if (saved[d.id] && saved[d.id] !== nSec(d)){ rescaleDevice(d.id, saved[d.id], nSec(d)); fresh = true; }
       if (fillUnassigned()) fresh = true;
     } else {
-      S.tracks = defaultTracks(feat); defaultLayout(); rebuild();
+      S.tracks = defaultTracks(feat);
+      if (isLong()) for (const t of S.tracks) if (t.feature) t.style = t.feature === "drums" ? "pulse" : "follow";   // calmer, lighter shows for hours-long songs
+      defaultLayout(); rebuild();
       if (Array.isArray(show.cues) && show.cues.length){        // show made with the first version of Light Studio
         S.tracks.push(normTrack({ id: "whole", name: "Whole strip", feature: null, style: "off", palette: "white", cues: show.cues, segs: enabledDevs().flatMap(secKeys) }));
       } else generateLanes(S.tracks.map(t => t.id), { bpc: 4 }, false);
@@ -2149,9 +2366,10 @@ async function openSong(id, isNew){
     $("empty").hidden = true; $("editor").hidden = false;
     $("songName").value = show.name || "Untitled";
     $("songMeta").textContent = `${fmtTime(S.dur)} · ~${Math.round(an.tempo)} BPM`;
+    if (fresh) showBusy("Saving the show…");
     $("saveState").textContent = "";
     buildLeds(); renderHeads(); renderLayout(); resizeCanvas(); fitView(); updateLoopUI(); renderInspector();
-    if (fresh) await saveNow();
+    if (fresh){ S.tracksDirty = true; await saveNow(); }
     loadLibrary();
     await checkSeparation(id, isNew);
   } catch (e){ alert("Couldn't open this song: " + e.message); console.error(e); }
@@ -2250,7 +2468,7 @@ async function pollSep(id){
 async function applyAiFeatures(id){
   let feat; try { feat = await api(`/api/song/${id}/features`); } catch (e){ return sepOffer(); }
   if (id !== S.id || !feat || feat.source !== "demucs") return sepOffer();
-  S.feat = feat; S.drops = computeDrops();
+  S.feat = prepFeat(feat); S.drops = computeDrops();
   const regen = () => {
     pushUndo();
     let added = false;
@@ -2287,10 +2505,10 @@ function updateLoopUI(){
   S.staticDirty = true;
 }
 function toggleLoop(){ S.loop = !S.loop; updateLoopUI(); }
-function setA(){ S.A = r3(audio.currentTime); if (S.B != null && S.B <= S.A + 0.05) S.B = null; updateLoopUI(); scheduleSave(); }
-function setB(){ const t = r3(audio.currentTime); if (S.A == null || t <= S.A + 0.05){ S.B = null; S.A = t; } else S.B = t; updateLoopUI(); scheduleSave(); }
+function setA(){ S.A = r3(audio.currentTime); if (S.B != null && S.B <= S.A + 0.05) S.B = null; updateLoopUI(); scheduleSave(true); }
+function setB(){ const t = r3(audio.currentTime); if (S.A == null || t <= S.A + 0.05){ S.B = null; S.A = t; } else S.B = t; updateLoopUI(); scheduleSave(true); }
 $("loopBtn").onclick = toggleLoop; $("setA").onclick = setA; $("setB").onclick = setB;
-$("clearAB").onclick = () => { S.A = S.B = null; updateLoopUI(); scheduleSave(); };
+$("clearAB").onclick = () => { S.A = S.B = null; updateLoopUI(); scheduleSave(true); };
 $("undoBtn").onclick = undo; $("redoBtn").onclick = redo;
 
 // ---------------------------------------------------------------- lane headers
@@ -2420,7 +2638,7 @@ function drawStatic(){
     g.fillStyle = "#ff6a3d"; g.beginPath(); g.moveTo(x, G.ruler); g.lineTo(x + 8, G.ruler - 6); g.lineTo(x, G.ruler - 12); g.closePath(); g.fill();
     g.font = "bold 10px system-ui"; g.fillText("DROP", x + 10, G.ruler - 3);
   }
-  const step = [0.1, 0.25, 0.5, 1, 2, 5, 10, 15, 30, 60, 120].find(s => s * S.pps >= 70) || 120;
+  const step = [0.1, 0.25, 0.5, 1, 2, 5, 10, 15, 30, 60, 120, 300, 600, 900, 1800, 3600, 7200].find(s => s * S.pps >= 70) || 7200;
   g.font = "11px system-ui"; g.fillStyle = "#8a94a6"; g.strokeStyle = "#2b3342"; g.lineWidth = 1;
   for (let t = Math.floor(t0 / step) * step; t <= t1; t += step){
     const x = Math.round(xOf(t)) + 0.5; g.beginPath(); g.moveTo(x, 14); g.lineTo(x, G.ruler); g.stroke(); g.fillText(fmtTime(t, step < 1), x + 3, 12);
@@ -2455,6 +2673,12 @@ function drawStatic(){
       for (let x = 0; x < W; x += 2){ const v = envMax(f, tOf(x), tOf(x + 2)); if (v > 0) g.fillRect(x, y0 + G.lane - 3 - v * (G.lane - 18), 2, v * (G.lane - 18)); }
     }
     const cues = tr.cues, ci = Math.max(0, firstIndexAt(cues, t0 - 10, "t"));
+    if (firstIndexAt(cues, t1 + 0.1, "t") - ci > Math.max(1500, W * 3)){   // too many to draw one by one (hours in view)
+      g.fillStyle = "rgba(160,170,190,.55)"; g.font = "11px system-ui";
+      g.fillText(`${cues.length.toLocaleString()} cues — zoom in to edit`, 6, y0 + G.lane - 8);
+      g.fillStyle = "#1c2330"; g.fillRect(0, y0, W, 1);
+      return;
+    }
     g.lineWidth = 2;
     for (let i = ci; i < cues.length && cues[i].t <= t1 + 0.1; i++){
       const c = cues[i]; if (!(c.fade > 0)) continue;
@@ -2530,7 +2754,7 @@ cv.addEventListener("pointerdown", e => {
       if (e.shiftKey || e.ctrlKey || e.metaKey){ if (S.sel.has(hit)) S.sel.delete(hit); else S.sel.add(hit); }
       else if (!S.sel.has(hit)) S.sel = new Set([hit]);
       renderInspector(); S.staticDirty = true;
-      if (S.sel.has(hit)) drag = { kind: "move", anchor: hit, x0: x, orig: new Map([...S.sel].map(c => [c, c.t])), snap: snapshot(), moved: false };
+      if (S.sel.has(hit)) drag = { kind: "move", anchor: hit, x0: x, orig: new Map([...S.sel].map(c => [c, c.t])), moved: false };
     } else {
       drag = { kind: "box", x0: x, x1: x, y0: y, y1: y, add: e.shiftKey || e.ctrlKey || e.metaKey };
       if (e.pointerType !== "mouse"){                       // touch: press and hold an empty spot to add a cue
@@ -2559,7 +2783,7 @@ cv.addEventListener("pointermove", e => {
   const { x, y } = canvasPos(e);
   if (drag.kind === "move"){
     if (!drag.moved && Math.abs(x - drag.x0) < 3) return;
-    if (!drag.moved){ S.undo.push(drag.snap); S.redo = []; S.edited = true; drag.moved = true; }
+    if (!drag.moved){ pushUndo(); drag.moved = true; }
     const o = drag.orig.get(drag.anchor); let na = o + (x - drag.x0) / S.pps;
     if (!e.altKey) na = snapT(na);
     const delta = na - o;
@@ -2590,7 +2814,7 @@ function pointerEnd(e){
     if (Math.abs(d.x1 - d.x0) < 4) seek(tOf(d.x0));
     else {
       S.A = r3(clamp(snapT(tOf(Math.min(d.x0, d.x1))), 0, S.dur)); S.B = r3(clamp(snapT(tOf(Math.max(d.x0, d.x1))), 0, S.dur));
-      updateLoopUI(); scheduleSave(); if (audio.currentTime < S.A || audio.currentTime > S.B) seek(S.A);
+      updateLoopUI(); scheduleSave(true); if (audio.currentTime < S.A || audio.currentTime > S.B) seek(S.A);
     }
   }
 }

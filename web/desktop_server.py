@@ -54,8 +54,8 @@ AUDIO_EXTS = {".mp3", ".wav", ".ogg", ".oga", ".m4a", ".aac", ".flac", ".opus", 
 YT_RE = re.compile(r"^https?://((www|m|music)\.)?(youtube\.com|youtu\.be)/", re.I)
 MAX_MINUTES = 30
 MAX_UPLOAD = 400 * 1024 * 1024
-SONG_RE = re.compile(r"^/api/song/([0-9a-f]{12})(?:/(audio|show|features|separate))?$")
-SHOW_KEYS = {"name", "cues", "tracks", "analysis", "duration", "loopA", "loopB", "segCount", "segCounts", "version"}
+SONG_RE = re.compile(r"^/api/song/([0-9a-f]{12})(?:/(audio|show|features|separate|tracks|info))?$")
+SHOW_KEYS = {"name", "cues", "tracks", "analysis", "duration", "loopA", "loopB", "segCount", "segCounts", "version", "cueCount"}
 
 GOVEE_CMD_PORT = 4003
 GOVEE_RESP_PORT = 4002
@@ -157,7 +157,7 @@ def list_library():
         items.append({
             "id": d.name, "name": s.get("name") or "Untitled", "updated": s.get("updated", 0),
             "duration": s.get("duration"), "tempo": (s.get("analysis") or {}).get("tempo"),
-            "cues": cue_count(s), "ai": source == "demucs",
+            "cues": s["cueCount"] if isinstance(s.get("cueCount"), int) else cue_count(s), "ai": source == "demucs",
         })
     items.sort(key=lambda i: i["updated"], reverse=True)
     return items
@@ -746,7 +746,8 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/api/config":
             return self._json(load_config())
         if path == "/api/capabilities":
-            return self._json({"demucs": demucs_available(), "bluetooth": BLE.available, "youtube": youtube_available()})
+            return self._json({"demucs": demucs_available(), "bluetooth": BLE.available, "youtube": youtube_available(),
+                               "pcm": False, "platform": "desktop"})
         m = re.match(r"^/api/youtube/([0-9a-f]{8})$", path)
         if m:
             return self._json(YT_JOBS.get(m.group(1), {"state": "error", "msg": "Unknown download"}))
@@ -772,7 +773,14 @@ class Handler(BaseHTTPRequestHandler):
             return self._error(404, "Not found")
         sid, what = m.groups()
         if what == "show":
-            return self._json(read_show(sid))
+            show = read_show(sid)
+            tracks = LIBRARY / sid / "tracks.json"
+            if tracks.exists():
+                show["tracks"] = json.loads(tracks.read_text())
+            return self._json(show)
+        if what == "info":
+            show = read_show(sid)
+            return self._json({"bytes": (LIBRARY / sid / show["file"]).stat().st_size, "duration": None})
         if what == "audio":
             return self._send_audio(sid)
         if what == "features":
@@ -827,6 +835,8 @@ class Handler(BaseHTTPRequestHandler):
         m = SONG_RE.match(path)
         if m and m.group(2) == "show":          # sendBeacon save when the page closes
             return self._save_show(m.group(1))
+        if m and m.group(2) == "tracks":
+            return self._save_tracks(m.group(1))
         if m and m.group(2) == "separate":
             return self._start_separation(m.group(1))
         self._error(404, "Not found")
@@ -835,6 +845,8 @@ class Handler(BaseHTTPRequestHandler):
         m = SONG_RE.match(urlparse(self.path).path)
         if m and m.group(2) == "show":
             return self._save_show(m.group(1))
+        if m and m.group(2) == "tracks":
+            return self._save_tracks(m.group(1))
         if m and m.group(2) == "features":
             return self._save_features(m.group(1))
         self._error(404, "Not found")
@@ -917,9 +929,27 @@ class Handler(BaseHTTPRequestHandler):
             for k in SHOW_KEYS:
                 if k in incoming:
                     show[k] = incoming[k]
+            tracks = LIBRARY / sid / "tracks.json"
+            if "tracks" in incoming:
+                tracks.unlink(missing_ok=True)     # an older editor saved everything in one file
+            elif tracks.exists():
+                show.pop("tracks", None)
             show["updated"] = time.time()
             write_json(LIBRARY / sid / "show.json", show)
         self._json({"ok": True, "updated": show["updated"]})
+
+    def _save_tracks(self, sid):
+        d = LIBRARY / sid
+        if not d.is_dir():
+            raise FileNotFoundError(sid)
+        raw = self._body(limit=400 * 1024 * 1024)
+        if not raw.lstrip().startswith(b"["):
+            raise ValueError("Not valid show data")
+        with _file_lock:
+            tmp = d / "tracks.json.tmp"
+            tmp.write_bytes(raw)
+            tmp.replace(d / "tracks.json")
+        self._json({"ok": True})
 
     def _save_features(self, sid):
         incoming = self._body_json()
@@ -949,16 +979,45 @@ class Handler(BaseHTTPRequestHandler):
         self._json({"ok": True})
 
     def _send_audio(self, sid):
+        """Audio with HTTP Range support so the player streams and seeks instead of loading the whole file."""
         show = read_show(sid)
         f = LIBRARY / sid / show["file"]
         ctype = mimetypes.guess_type(f.name)[0] or "application/octet-stream"
-        self.send_response(200)
+        size = f.stat().st_size
+        start, end, partial = 0, size - 1, False
+        rng = self.headers.get("Range", "")
+        m = re.match(r"^bytes=(\d*)-(\d*)$", rng.strip())
+        if m and (m.group(1) or m.group(2)):
+            if m.group(1):
+                start = int(m.group(1))
+                if m.group(2):
+                    end = min(end, int(m.group(2)))
+            else:
+                start = max(0, size - int(m.group(2)))
+            partial = True
+            if start >= size or start > end:
+                self.send_response(416)
+                self.send_header("Content-Range", f"bytes */{size}")
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+                return
+        self.send_response(206 if partial else 200)
         self.send_header("Content-Type", ctype)
-        self.send_header("Content-Length", str(f.stat().st_size))
+        self.send_header("Content-Length", str(end - start + 1))
+        self.send_header("Accept-Ranges", "bytes")
+        if partial:
+            self.send_header("Content-Range", f"bytes {start}-{end}/{size}")
         self.send_header("Cache-Control", "no-store")
         self.end_headers()
         with open(f, "rb") as fh:
-            shutil.copyfileobj(fh, self.wfile, 1 << 20)
+            fh.seek(start)
+            left = end - start + 1
+            while left > 0:
+                chunk = fh.read(min(1 << 20, left))
+                if not chunk:
+                    break
+                self.wfile.write(chunk)
+                left -= len(chunk)
 
 
 def main():
